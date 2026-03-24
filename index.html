@@ -18,6 +18,9 @@
     
     <!-- Lucide React Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
+
+    <!-- MSAL.js for Microsoft 365 SSO Authentication -->
+    <script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"></script>
     
     <style>
         /* Emory Branding Colors */
@@ -123,6 +126,229 @@
 <body>
     <div id="root"></div>
     
+    <!-- MSAL Authentication Service (runs before React/Babel) -->
+    <script>
+        /**
+         * MSAL Authentication Service for Microsoft 365 SSO
+         * Provides seamless authentication for Emory users accessing SharePoint data
+         * from the externally hosted dashboard (GitHub Pages).
+         *
+         * When running inside SharePoint (cookie auth), this is bypassed.
+         * When running outside SharePoint, MSAL handles token acquisition.
+         */
+        window.MSALAuthService = (function() {
+            const SHAREPOINT_SITE = 'https://emory.sharepoint.com/sites/GeneralSurgery';
+
+            // MSAL Configuration
+            // NOTE: To enable full SSO, register an Azure AD app at https://portal.azure.com
+            // Required: Single-page application redirect URI = your GitHub Pages URL
+            // Required API permissions: Sites.Read.All, User.Read, Group.Read.All
+            const msalConfig = {
+                auth: {
+                    // Default: Microsoft common endpoint (works for any Microsoft account)
+                    // Replace with your registered Azure AD App Client ID for full SSO
+                    clientId: window.MSAL_CLIENT_ID || '00000000-0000-0000-0000-000000000000',
+                    authority: window.MSAL_AUTHORITY || 'https://login.microsoftonline.com/emory.edu',
+                    redirectUri: window.location.origin + window.location.pathname,
+                    postLogoutRedirectUri: window.location.origin + window.location.pathname,
+                },
+                cache: {
+                    cacheLocation: 'sessionStorage',
+                    storeAuthStateInCookie: false,
+                },
+                system: {
+                    loggerOptions: {
+                        logLevel: 0, // Error only
+                    }
+                }
+            };
+
+            const loginRequest = {
+                scopes: ['https://emory.sharepoint.com/.default']
+            };
+
+            const graphRequest = {
+                scopes: ['User.Read', 'Group.Read.All']
+            };
+
+            let msalInstance = null;
+            let currentAccount = null;
+            let isInitialized = false;
+            let initError = null;
+
+            // Initialize MSAL
+            async function initialize() {
+                try {
+                    if (typeof msal === 'undefined') {
+                        initError = 'MSAL library not loaded';
+                        return false;
+                    }
+
+                    // Skip MSAL if no real client ID configured
+                    if (msalConfig.auth.clientId === '00000000-0000-0000-0000-000000000000') {
+                        initError = 'no_client_id';
+                        isInitialized = false;
+                        return false;
+                    }
+
+                    msalInstance = new msal.PublicClientApplication(msalConfig);
+                    await msalInstance.initialize();
+
+                    // Handle redirect response
+                    const response = await msalInstance.handleRedirectPromise();
+                    if (response) {
+                        currentAccount = response.account;
+                    } else {
+                        const accounts = msalInstance.getAllAccounts();
+                        if (accounts.length > 0) {
+                            currentAccount = accounts[0];
+                        }
+                    }
+
+                    isInitialized = true;
+                    return true;
+                } catch (error) {
+                    console.warn('MSAL initialization failed:', error);
+                    initError = error.message;
+                    return false;
+                }
+            }
+
+            // Sign in with popup
+            async function signIn() {
+                if (!msalInstance) return null;
+                try {
+                    const response = await msalInstance.loginPopup(graphRequest);
+                    currentAccount = response.account;
+                    return currentAccount;
+                } catch (error) {
+                    console.error('Sign in failed:', error);
+                    return null;
+                }
+            }
+
+            // Sign out
+            async function signOut() {
+                if (!msalInstance || !currentAccount) return;
+                await msalInstance.logoutPopup({ account: currentAccount });
+                currentAccount = null;
+            }
+
+            // Get access token for SharePoint
+            async function getSharePointToken() {
+                if (!msalInstance || !currentAccount) return null;
+                try {
+                    const response = await msalInstance.acquireTokenSilent({
+                        ...loginRequest,
+                        account: currentAccount
+                    });
+                    return response.accessToken;
+                } catch (error) {
+                    // Silent token acquisition failed, try popup
+                    try {
+                        const response = await msalInstance.acquireTokenPopup(loginRequest);
+                        return response.accessToken;
+                    } catch (popupError) {
+                        console.error('Token acquisition failed:', popupError);
+                        return null;
+                    }
+                }
+            }
+
+            // Get access token for Microsoft Graph
+            async function getGraphToken() {
+                if (!msalInstance || !currentAccount) return null;
+                try {
+                    const response = await msalInstance.acquireTokenSilent({
+                        ...graphRequest,
+                        account: currentAccount
+                    });
+                    return response.accessToken;
+                } catch (error) {
+                    try {
+                        const response = await msalInstance.acquireTokenPopup(graphRequest);
+                        return response.accessToken;
+                    } catch (popupError) {
+                        console.error('Graph token acquisition failed:', popupError);
+                        return null;
+                    }
+                }
+            }
+
+            // Get current user info from Graph API
+            async function getCurrentUser() {
+                const token = await getGraphToken();
+                if (!token) return null;
+                try {
+                    const response = await fetch('https://graph.microsoft.com/v1.0/me', {
+                        headers: { 'Authorization': 'Bearer ' + token }
+                    });
+                    if (response.ok) return await response.json();
+                    return null;
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            // Get user's group memberships from Graph API
+            async function getUserGroups() {
+                const token = await getGraphToken();
+                if (!token) return [];
+                try {
+                    const response = await fetch('https://graph.microsoft.com/v1.0/me/memberOf', {
+                        headers: { 'Authorization': 'Bearer ' + token }
+                    });
+                    if (response.ok) {
+                        const data = await response.json();
+                        return data.value.map(g => g.displayName).filter(Boolean);
+                    }
+                    return [];
+                } catch (e) {
+                    return [];
+                }
+            }
+
+            // Make authenticated SharePoint REST API call
+            async function fetchSharePoint(endpoint, options = {}) {
+                const token = await getSharePointToken();
+                if (!token) throw new Error('No SharePoint access token');
+
+                const headers = {
+                    'Accept': 'application/json;odata=verbose',
+                    'Content-Type': 'application/json;odata=verbose',
+                    'Authorization': 'Bearer ' + token,
+                    ...(options.headers || {})
+                };
+
+                const response = await fetch(endpoint, { ...options, headers });
+                if (!response.ok) {
+                    throw new Error('SharePoint API error: ' + response.status);
+                }
+                return await response.json();
+            }
+
+            return {
+                initialize,
+                signIn,
+                signOut,
+                getSharePointToken,
+                getGraphToken,
+                getCurrentUser,
+                getUserGroups,
+                fetchSharePoint,
+                get isInitialized() { return isInitialized; },
+                get currentAccount() { return currentAccount; },
+                get initError() { return initError; },
+                SHAREPOINT_SITE
+            };
+        })();
+
+        // Auto-initialize MSAL on page load
+        window.MSALAuthService.initialize().then(ok => {
+            console.log('MSAL init:', ok ? 'success' : window.MSALAuthService.initError);
+        });
+    </script>
+
     <script type="text/babel">
         // ========================================
         // UTILITY FUNCTIONS
@@ -137,15 +363,28 @@
                 'Accept': 'application/json',
                 'Content-Type': 'application/json',
             };
-            
+
+            // If running outside SharePoint with MSAL, add Bearer token
+            if (!isSharePointContext() && isMSALAuthenticated()) {
+                try {
+                    const token = await window.MSALAuthService.getSharePointToken();
+                    if (token) {
+                        defaultHeaders['Authorization'] = `Bearer ${token}`;
+                    }
+                } catch (e) {
+                    console.warn('Could not get MSAL token for SharePoint:', e);
+                }
+            }
+
             const config = {
                 ...options,
                 headers: {
                     ...defaultHeaders,
                     ...options.headers,
                 },
+                credentials: isSharePointContext() ? 'include' : undefined,
             };
-            
+
             try {
                 const response = await fetch(endpoint, config);
                 if (!response.ok) {
@@ -270,67 +509,90 @@
         const isSharePointContext = () => {
             return typeof window !== 'undefined' && typeof window._spPageContextInfo !== 'undefined';
         };
-        
+
         /**
-         * Gets current user from SharePoint context
+         * Check if MSAL authentication is available and user is signed in
+         */
+        const isMSALAuthenticated = () => {
+            return window.MSALAuthService && window.MSALAuthService.isInitialized && window.MSALAuthService.currentAccount;
+        };
+
+        /**
+         * Gets current user from SharePoint context or MSAL
          */
         const getSharePointUser = async () => {
             try {
-                if (!isSharePointContext()) {
-                    return null;
+                // Path 1: Running inside SharePoint (cookie auth)
+                if (isSharePointContext()) {
+                    const userDisplayName = window._spPageContextInfo.userDisplayName;
+                    const userLoginName = window._spPageContextInfo.userLoginName;
+                    return { displayName: userDisplayName, loginName: userLoginName };
                 }
-                
-                const userDisplayName = window._spPageContextInfo.userDisplayName;
-                const userLoginName = window._spPageContextInfo.userLoginName;
-                
-                return {
-                    displayName: userDisplayName,
-                    loginName: userLoginName,
-                };
+
+                // Path 2: Running externally with MSAL auth
+                if (isMSALAuthenticated()) {
+                    const graphUser = await window.MSALAuthService.getCurrentUser();
+                    if (graphUser) {
+                        return {
+                            displayName: graphUser.displayName,
+                            loginName: graphUser.userPrincipalName || graphUser.mail,
+                        };
+                    }
+                }
+
+                return null;
             } catch (error) {
-                console.error('Error getting SharePoint user:', error);
+                console.error('Error getting user:', error);
                 return null;
             }
         };
-        
+
         /**
-         * Detects user role from SharePoint group membership
+         * Detects user role from SharePoint group membership or MSAL Graph groups
          */
         const detectSharePointRole = async () => {
             try {
-                if (!isSharePointContext()) {
+                // Path 1: Running inside SharePoint (cookie auth)
+                if (isSharePointContext()) {
+                    const siteUrl = window._spPageContextInfo.webServerRelativeUrl;
+                    const response = await fetch(`${siteUrl}/_api/web/currentuser/groups`, {
+                        method: 'GET',
+                        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                        credentials: 'include',
+                    });
+
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+                    const data = await response.json();
+                    const groups = data.value.map(g => g.Title);
+
+                    if (groups.includes('Research_Admins')) return 'Admin';
+                    if (groups.includes('Research_Mentors')) return 'Mentor';
+                    if (groups.includes('Research_Residents')) return 'Resident';
                     return null;
                 }
-                
-                const siteUrl = window._spPageContextInfo.webServerRelativeUrl;
-                const response = await fetch(`${siteUrl}/_api/web/currentuser/groups`, {
-                    method: 'GET',
-                    headers: {
-                        'Accept': 'application/json',
-                        'Content-Type': 'application/json',
-                    },
-                    credentials: 'include',
-                });
-                
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
+
+                // Path 2: Running externally with MSAL auth
+                if (isMSALAuthenticated()) {
+                    const groups = await window.MSALAuthService.getUserGroups();
+
+                    // Check Azure AD / Microsoft 365 group names
+                    const groupNames = groups.map(g => g.toLowerCase());
+                    if (groupNames.some(g => g.includes('research') && g.includes('admin'))) return 'Admin';
+                    if (groupNames.some(g => g.includes('research') && g.includes('mentor'))) return 'Mentor';
+                    if (groupNames.some(g => g.includes('research') && g.includes('resident'))) return 'Resident';
+
+                    // Default to Resident for authenticated Emory users
+                    const account = window.MSALAuthService.currentAccount;
+                    if (account && account.username && account.username.includes('emory.edu')) {
+                        return 'Resident';
+                    }
+                    return null;
                 }
-                
-                const data = await response.json();
-                const groups = data.value.map(g => g.Title);
-                
-                // Map SharePoint groups to application roles
-                if (groups.includes('Research_Admins')) {
-                    return 'Admin';
-                } else if (groups.includes('Research_Mentors')) {
-                    return 'Mentor';
-                } else if (groups.includes('Research_Residents')) {
-                    return 'Resident';
-                }
-                
+
                 return null;
             } catch (error) {
-                console.error('Error detecting SharePoint role:', error);
+                console.error('Error detecting role:', error);
                 return null;
             }
         };
@@ -1719,40 +1981,83 @@
         // MAIN APPLICATION COMPONENT
         // ========================================
         
+        /**
+         * Sign-In Banner shown when MSAL is configured but user hasn't signed in
+         */
+        const MSALSignInBanner = ({ onSignIn }) => {
+            const [signingIn, setSigningIn] = React.useState(false);
+            const auth = window.MSALAuthService;
+
+            // Don't show if MSAL not configured or already authenticated or in SharePoint
+            if (isSharePointContext() || !auth || auth.initError === 'no_client_id') return null;
+            if (auth.isInitialized && auth.currentAccount) return null;
+
+            const handleSignIn = async () => {
+                setSigningIn(true);
+                const account = await auth.signIn();
+                setSigningIn(false);
+                if (account && onSignIn) onSignIn();
+            };
+
+            return (
+                <div className="bg-blue-50 border-l-4 border-blue-500 p-4 mx-4 mt-4 rounded-r-lg">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <p className="text-blue-800 font-semibold text-sm">Connect to Emory SharePoint</p>
+                            <p className="text-blue-600 text-xs mt-1">
+                                Sign in with your Emory Microsoft 365 account for live data access. Currently viewing demo data.
+                            </p>
+                        </div>
+                        <button
+                            onClick={handleSignIn}
+                            disabled={signingIn}
+                            className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50"
+                        >
+                            {signingIn ? 'Signing in...' : 'Sign in with Microsoft'}
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
         const App = () => {
             const [currentRole, setCurrentRole] = React.useState('Resident');
             const [currentUser, setCurrentUser] = React.useState('Dr. Sarah Johnson');
-            
+            const [authMode, setAuthMode] = React.useState('demo'); // 'demo', 'sharepoint', 'msal'
+
             /**
-             * Detect user role from SharePoint context or use manual selector
+             * Detect user role from SharePoint context, MSAL, or use manual selector
              */
             const detectUserRole = React.useCallback(async () => {
                 try {
-                    // Try to get user info from SharePoint
+                    // Try to get user info from SharePoint or MSAL
                     const spUser = await getSharePointUser();
                     if (spUser) {
                         setCurrentUser(spUser.displayName);
-                        
-                        // Try to detect role from SharePoint groups
+                        setAuthMode(isSharePointContext() ? 'sharepoint' : 'msal');
+
+                        // Try to detect role
                         const detectedRole = await detectSharePointRole();
                         if (detectedRole) {
                             setCurrentRole(detectedRole);
-                            console.log(`SharePoint role detected: ${detectedRole} for user: ${spUser.displayName}`);
+                            console.log(`Role detected: ${detectedRole} for user: ${spUser.displayName}`);
                             return;
                         }
                     }
-                    
-                    // Fallback to manual role selector if not in SharePoint or detection failed
-                    console.log('Role detection: using manual selector (not in SharePoint or detection failed)');
+
+                    // Fallback to demo mode with manual role selector
+                    setAuthMode('demo');
+                    console.log('Role detection: using demo mode with manual selector');
                 } catch (error) {
                     console.error('Error detecting user role:', error);
+                    setAuthMode('demo');
                 }
             }, []);
-            
+
             React.useEffect(() => {
                 detectUserRole();
             }, [detectUserRole]);
-            
+
             return (
                 <div className="min-h-screen bg-gray-100">
                     <NavBar
@@ -1760,11 +2065,14 @@
                         currentRole={currentRole}
                         onRoleChange={setCurrentRole}
                     />
-                    
+
+                    {/* MSAL Sign-In Banner (only shows when MSAL is configured but not signed in) */}
+                    <MSALSignInBanner onSignIn={detectUserRole} />
+
                     {currentRole === 'Resident' && <ResidentDashboard currentUser={currentUser} />}
                     {currentRole === 'Mentor' && <MentorDashboard currentUser={currentUser} />}
                     {currentRole === 'Admin' && <AdminDashboard currentUser={currentUser} />}
-                    
+
                     {/* Footer */}
                     <footer className="bg-gray-800 text-white py-6 mt-12 border-t border-gray-700">
                         <div className="max-w-7xl mx-auto px-4">
@@ -1774,8 +2082,10 @@
                                     <p className="text-xs text-gray-400 mt-1">Built with React & Tailwind CSS • SharePoint Integrated</p>
                                 </div>
                                 <div className="text-center md:text-right">
-                                    <p className="text-xs text-gray-400">v2.0 • SharePoint Deployment Ready</p>
-                                    <p className="text-xs text-gray-400 mt-1">Site: https://emory.sharepoint.com/sites/GeneralSurgery</p>
+                                    <p className="text-xs text-gray-400">
+                                        v2.1 • {authMode === 'sharepoint' ? 'SharePoint Connected' : authMode === 'msal' ? 'Microsoft 365 Connected' : 'Demo Mode'}
+                                    </p>
+                                    <p className="text-xs text-gray-400 mt-1">Emory University School of Medicine</p>
                                 </div>
                             </div>
                         </div>
