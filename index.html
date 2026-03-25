@@ -353,6 +353,89 @@
         });
     </script>
 
+    <!-- Power Automate HTTP Proxy Service -->
+    <script>
+        /**
+         * Power Automate Proxy Service
+         * Routes SharePoint data requests through a Power Automate HTTP-triggered flow.
+         * This allows the externally-hosted dashboard to read/write SharePoint data
+         * without requiring Azure AD app registration or MSAL tokens.
+         * The flow runs under the creator's SharePoint connection (Logan Glosser).
+         */
+        window.PAProxy = (function() {
+            const FLOW_URL = 'https://52feed5561a6e01ebaa5708aefd50b.14.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/650ab0d8538a4276ad371804a0c796db/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=5UXJJaRZmzI_Q1QIkyKrwogUNioA-rAkjpa_Y3i7mII';
+            const SITE_URL = 'https://emory.sharepoint.com/sites/GeneralSurgery';
+
+            // Known SharePoint list mappings
+            const LIST_MAP = {
+                'Research Cycles': '871acdfb-1f9b-4433-b356-671c906293b7',
+                'Residents': '9098322e-71d3-49b6-bbe7-1cb9ef206b84',
+                'Faculty': '8f4603a0-fe9c-45e2-8c53-653bfcbe929d',
+                'Extension Requests': 'b4a62604-2936-49eb-8966-117ec048f35c',
+                'Generated Documents': 'd4f832c1-11c6-47d4-bb44-10e5771ff8b9',
+                'Residents Master': 'Residents Master',
+                'Mentor Profiles': 'Mentor Profiles',
+            };
+
+            async function callFlow(payload) {
+                const resp = await fetch(FLOW_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!resp.ok) {
+                    const errText = await resp.text();
+                    throw new Error('Flow error ' + resp.status + ': ' + errText);
+                }
+                return await resp.json();
+            }
+
+            // Get items from a SharePoint list
+            async function getListItems(listName, filter, top) {
+                const tableId = LIST_MAP[listName] || listName;
+                const payload = {
+                    action: 'get_list_items',
+                    site: SITE_URL,
+                    list: tableId,
+                };
+                if (filter) payload.filter = filter;
+                if (top) payload.top = top;
+                const result = await callFlow(payload);
+                return result.data || [];
+            }
+
+            // Create a new item in a SharePoint list
+            async function createListItem(listName, itemData) {
+                const tableId = LIST_MAP[listName] || listName;
+                const payload = {
+                    action: 'create_item',
+                    site: SITE_URL,
+                    list: tableId,
+                    item: itemData
+                };
+                const result = await callFlow(payload);
+                return result.data || null;
+            }
+
+            // Get current user info (static — flow runs under creator creds)
+            async function getUserInfo() {
+                const result = await callFlow({ action: 'get_user' });
+                return result.data || null;
+            }
+
+            return {
+                getListItems: getListItems,
+                createListItem: createListItem,
+                getUserInfo: getUserInfo,
+                callFlow: callFlow,
+                SITE_URL: SITE_URL,
+                LIST_MAP: LIST_MAP,
+                isAvailable: true,
+            };
+        })();
+        console.log('PAProxy service initialized');
+    </script>
+
     <script type="text/babel">
         // ========================================
         // UTILITY FUNCTIONS
@@ -363,6 +446,22 @@
          * Includes proper headers for CORS and authentication
          */
         const fetchSharePoint = async (endpoint, options = {}) => {
+            // If running outside SharePoint, route through Power Automate proxy
+            if (!isSharePointContext() && window.PAProxy && window.PAProxy.isAvailable) {
+                // Parse the endpoint to extract list name and query params
+                const listMatch = endpoint.match(/getByTitle\('([^']+)'\)\/items/i) ||
+                                  endpoint.match(/lists\/([^/]+)\/items/i);
+                if (listMatch) {
+                    const listName = listMatch[1];
+                    const urlObj = new URL(endpoint, 'https://emory.sharepoint.com');
+                    const filter = urlObj.searchParams.get('$filter') || '';
+                    const top = urlObj.searchParams.get('$top') ? parseInt(urlObj.searchParams.get('$top')) : undefined;
+                    const items = await window.PAProxy.getListItems(listName, filter, top);
+                    return { d: { results: items }, value: items };
+                }
+                // For non-list endpoints, fall through to direct fetch
+            }
+
             const defaultHeaders = {
                 'Accept': 'application/json',
                 'Content-Type': 'application/json',
@@ -637,14 +736,19 @@
          */
         const createSharePointListItem = async (listName, itemData) => {
             try {
+                // Use Power Automate proxy when outside SharePoint
+                if (!isSharePointContext() && window.PAProxy && window.PAProxy.isAvailable) {
+                    return await window.PAProxy.createListItem(listName, itemData);
+                }
+
                 if (!isSharePointContext()) {
-                    console.warn('Not in SharePoint context, skipping item creation');
+                    console.warn('Not in SharePoint context and no proxy available, skipping item creation');
                     return null;
                 }
-                
+
                 const digest = await getRequestDigest();
                 const siteUrl = window._spPageContextInfo.webServerRelativeUrl;
-                
+
                 const response = await fetch(`${siteUrl}/_api/web/lists/getbytitle('${listName}')/items`, {
                     method: 'POST',
                     headers: {
@@ -655,11 +759,11 @@
                     body: JSON.stringify(itemData),
                     credentials: 'include',
                 });
-                
+
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
-                
+
                 return await response.json();
             } catch (error) {
                 console.error('Error creating SharePoint list item:', error);
@@ -1260,62 +1364,69 @@
                 CareerGoals: '',
             });
             
-            // Load resident data on mount
+            // Load resident data on mount — uses Power Automate proxy when outside SharePoint
             React.useEffect(() => {
                 const loadData = async () => {
                     try {
                         setLoading(true);
-                        
-                        // In production, this would fetch actual data from SharePoint
-                        // Mock data for demonstration
-                        setResidents([{
-                            ResidentKey: 'RES001',
-                            ResidentName: currentUser,
-                            EmoryEmail: `${currentUser.toLowerCase().replace(' ', '.')}@emory.edu`,
-                            PGYLevel: 'PGY-2',
-                            MentorKey: 'MENT001',
-                            StartDate: '2023-07-01',
-                            EndDate: '2026-06-30',
-                            ResearchTrack: 'Clinical Research',
-                        }]);
-                        
-                        setResearchCycles([
-                            {
-                                CycleKey: 'CYC001',
-                                ResidentKey: 'RES001',
-                                ProjectTitle: 'Novel Surgical Technique in Minimally Invasive Surgery',
-                                LOIStatus: 'Approved',
-                                ResearchPlanType: 'Clinical',
-                                ProjectOverview: 'Investigation of novel surgical approaches...',
-                            },
-                        ]);
-                        
-                        setDocuments([
-                            {
-                                DocumentKey: 'DOC001',
-                                DocumentType: 'LOI Submission',
-                                VersionNumber: 1,
-                                DraftStatus: 'Final',
-                                GeneratedDate: '2024-01-15',
-                            },
-                            {
-                                DocumentKey: 'DOC002',
-                                DocumentType: 'Research Proposal',
-                                VersionNumber: 2,
-                                DraftStatus: 'Draft',
-                                GeneratedDate: '2024-02-20',
-                            },
-                        ]);
-                        
-                        toast.addToast('Data loaded successfully', 'success');
+
+                        if (window.PAProxy && window.PAProxy.isAvailable && !isSharePointContext()) {
+                            // Live data via Power Automate proxy
+                            const [resData, cycleData, docData] = await Promise.all([
+                                window.PAProxy.getListItems('Residents').catch(() => []),
+                                window.PAProxy.getListItems('Research Cycles').catch(() => []),
+                                window.PAProxy.getListItems('Generated Documents').catch(() => []),
+                            ]);
+
+                            setResidents(resData.length > 0 ? resData : [{
+                                ResidentName: currentUser, PGYLevel: 'N/A',
+                                EmoryEmail: '', ResearchTrack: 'N/A',
+                                _fallback: true
+                            }]);
+                            setResearchCycles(cycleData);
+                            setDocuments(docData);
+                            toast.addToast('Live data loaded from SharePoint', 'success');
+                        } else if (isSharePointContext()) {
+                            // Direct SharePoint REST API calls
+                            const baseUrl = 'https://emory.sharepoint.com/sites/GeneralSurgery';
+                            const [resResp, cycleResp, docResp] = await Promise.all([
+                                fetchSharePoint(buildListEndpoint('Residents')).catch(() => ({ value: [] })),
+                                fetchSharePoint(buildListEndpoint('Research Cycles')).catch(() => ({ value: [] })),
+                                fetchSharePoint(buildListEndpoint('Generated Documents')).catch(() => ({ value: [] })),
+                            ]);
+                            setResidents((resResp.value || resResp.d?.results || []).length > 0
+                                ? (resResp.value || resResp.d?.results || [])
+                                : [{ ResidentName: currentUser, PGYLevel: 'N/A', _fallback: true }]);
+                            setResearchCycles(cycleResp.value || cycleResp.d?.results || []);
+                            setDocuments(docResp.value || docResp.d?.results || []);
+                            toast.addToast('Data loaded from SharePoint', 'success');
+                        } else {
+                            // Demo mode — mock data
+                            setResidents([{
+                                ResidentKey: 'DEMO001', ResidentName: currentUser,
+                                EmoryEmail: `${currentUser.toLowerCase().replace(' ', '.')}@emory.edu`,
+                                PGYLevel: 'PGY-2', MentorKey: 'MENT001',
+                                StartDate: '2023-07-01', EndDate: '2026-06-30',
+                                ResearchTrack: 'Clinical Research', _demo: true,
+                            }]);
+                            setResearchCycles([{
+                                CycleKey: 'DEMO-CYC001', ResidentKey: 'DEMO001',
+                                ProjectTitle: 'Sample Project (Demo Mode)',
+                                LOIStatus: 'Approved', ResearchPlanType: 'Clinical',
+                                ProjectOverview: 'Connect to SharePoint for live data.',
+                                _demo: true,
+                            }]);
+                            setDocuments([]);
+                            toast.addToast('Running in demo mode', 'info');
+                        }
                     } catch (error) {
                         console.error('Error loading data:', error);
-                        toast.addToast('Error loading dashboard data', 'error');
+                        toast.addToast('Error loading dashboard data: ' + error.message, 'error');
                     } finally {
                         setLoading(false);
                     }
                 };
-                
+
                 loadData();
             }, [currentUser, toast]);
             
@@ -1327,9 +1438,18 @@
                         return;
                     }
                     
-                    // In production, this would POST to SharePoint REST API
-                    console.log('Submitting LOI:', loiForm);
-                    
+                    // Submit LOI to SharePoint via proxy or direct
+                    const residentKey = residents[0]?.ResidentKey || 'UNKNOWN';
+                    const loiData = {
+                        Title: `${residentKey}_LOI_${new Date().toISOString().slice(0,10)}`,
+                        ResidentKey: residentKey,
+                        ...loiForm,
+                        'LOIStatus': 'Submitted',
+                        'CycleStatus': 'Draft',
+                    };
+                    await createSharePointListItem('Research Cycles', loiData);
+                    console.log('LOI submitted:', loiData);
+
                     toast.addToast('LOI submitted successfully', 'success');
                     setLoiPanelOpen(false);
                     setLoiForm({
@@ -1355,8 +1475,16 @@
                         return;
                     }
                     
-                    console.log('Submitting Review:', reviewForm);
-                    
+                    // Submit review to SharePoint via proxy or direct
+                    const reviewResidentKey = residents[0]?.ResidentKey || 'UNKNOWN';
+                    const reviewData = {
+                        Title: `${reviewResidentKey}_REVIEW_${new Date().toISOString().slice(0,10)}`,
+                        ResidentKey: reviewResidentKey,
+                        ...reviewForm,
+                    };
+                    await createSharePointListItem('Research Cycles', reviewData);
+                    console.log('Review submitted:', reviewData);
+
                     toast.addToast('Review submitted successfully', 'success');
                     setReviewPanelOpen(false);
                 } catch (error) {
@@ -1764,24 +1892,27 @@
                     try {
                         setLoading(true);
                         
-                        // Mock mentor data
-                        setResidents([
-                            {
-                                ResidentKey: 'RES001',
-                                ResidentName: 'Dr. Smith',
-                                ProjectTitle: 'Novel Surgical Technique',
-                                LOIStatus: 'Approved',
-                                PGYLevel: 'PGY-2',
-                            },
-                            {
-                                ResidentKey: 'RES002',
-                                ResidentName: 'Dr. Johnson',
-                                ProjectTitle: 'Clinical Outcomes Study',
-                                LOIStatus: 'Under Review',
-                                PGYLevel: 'PGY-3',
-                            },
-                        ]);
-                        
+                        // Load residents and their research cycles
+                        if (window.PAProxy && window.PAProxy.isAvailable && !isSharePointContext()) {
+                            const [resData, cycleData] = await Promise.all([
+                                window.PAProxy.getListItems('Residents').catch(() => []),
+                                window.PAProxy.getListItems('Research Cycles').catch(() => []),
+                            ]);
+                            // Merge cycle data into resident records
+                            const merged = resData.map(r => {
+                                const cycle = cycleData.find(c => c.ResidentKey === r.ResidentKey);
+                                return { ...r, ProjectTitle: cycle?.ProjectTitle || 'No project', LOIStatus: cycle?.LOIStatus || 'N/A' };
+                            });
+                            setResidents(merged.length > 0 ? merged : [
+                                { ResidentKey: 'DEMO', ResidentName: 'No residents found', ProjectTitle: 'N/A', LOIStatus: 'N/A', PGYLevel: 'N/A' }
+                            ]);
+                        } else {
+                            setResidents([
+                                { ResidentKey: 'DEMO001', ResidentName: 'Dr. Smith', ProjectTitle: 'Novel Surgical Technique', LOIStatus: 'Approved', PGYLevel: 'PGY-2', _demo: true },
+                                { ResidentKey: 'DEMO002', ResidentName: 'Dr. Johnson', ProjectTitle: 'Clinical Outcomes Study', LOIStatus: 'Under Review', PGYLevel: 'PGY-3', _demo: true },
+                            ]);
+                        }
+
                         toast.addToast('Mentor data loaded', 'success');
                     } catch (error) {
                         toast.addToast('Error loading mentor data', 'error');
@@ -1881,6 +2012,19 @@
                 const loadData = async () => {
                     try {
                         setLoading(true);
+                        if (window.PAProxy && window.PAProxy.isAvailable && !isSharePointContext()) {
+                            const [resData, cycleData, docData] = await Promise.all([
+                                window.PAProxy.getListItems('Residents').catch(() => []),
+                                window.PAProxy.getListItems('Research Cycles').catch(() => []),
+                                window.PAProxy.getListItems('Generated Documents').catch(() => []),
+                            ]);
+                            setStats({
+                                totalResidents: resData.length,
+                                activeCycles: cycleData.filter(c => c.CycleStatus?.Value !== 'Complete').length || cycleData.length,
+                                documentsThisMonth: docData.length,
+                                pendingApprovals: cycleData.filter(c => c.LOIStatus?.Value === 'Submitted' || c.LOIStatus === 'Submitted').length,
+                            });
+                        }
                         toast.addToast('Admin dashboard loaded', 'success');
                     } catch (error) {
                         toast.addToast('Error loading admin data', 'error');
@@ -1888,7 +2032,7 @@
                         setLoading(false);
                     }
                 };
-                
+
                 loadData();
             }, [toast]);
             
@@ -1992,9 +2136,10 @@
             const [signingIn, setSigningIn] = React.useState(false);
             const auth = window.MSALAuthService;
 
-            // Don't show if MSAL not configured or already authenticated or in SharePoint
+            // Don't show if MSAL not configured, already authenticated, in SharePoint, or using PAProxy
             if (isSharePointContext() || !auth || auth.initError === 'no_client_id') return null;
             if (auth.isInitialized && auth.currentAccount) return null;
+            if (window.PAProxy && window.PAProxy.isAvailable) return null;
 
             const handleSignIn = async () => {
                 setSigningIn(true);
@@ -2049,11 +2194,32 @@
                         }
                     }
 
+                    // If PAProxy is available (Power Automate backend), use it
+                    if (window.PAProxy && window.PAProxy.isAvailable) {
+                        setAuthMode('powerautomate');
+                        console.log('Using Power Automate proxy for data access');
+                        // User name comes from the Residents list or defaults
+                        try {
+                            const residents = await window.PAProxy.getListItems('Residents', '', 1);
+                            if (residents && residents.length > 0) {
+                                setCurrentUser(residents[0].ResidentName || residents[0].Title || 'Emory User');
+                            }
+                        } catch (e) {
+                            console.warn('Could not fetch user from Residents list:', e);
+                        }
+                        return;
+                    }
+
                     // Fallback to demo mode with manual role selector
                     setAuthMode('demo');
                     console.log('Role detection: using demo mode with manual selector');
                 } catch (error) {
                     console.error('Error detecting user role:', error);
+                    // Still try PAProxy even if MSAL/SP detection failed
+                    if (window.PAProxy && window.PAProxy.isAvailable) {
+                        setAuthMode('powerautomate');
+                        return;
+                    }
                     setAuthMode('demo');
                 }
             }, []);
@@ -2087,7 +2253,7 @@
                                 </div>
                                 <div className="text-center md:text-right">
                                     <p className="text-xs text-gray-400">
-                                        v2.1 • {authMode === 'sharepoint' ? 'SharePoint Connected' : authMode === 'msal' ? 'Microsoft 365 Connected' : 'Demo Mode'}
+                                        v2.2 • {authMode === 'sharepoint' ? 'SharePoint Connected' : authMode === 'msal' ? 'Microsoft 365 Connected' : authMode === 'powerautomate' ? 'Power Automate Connected' : 'Demo Mode'}
                                     </p>
                                     <p className="text-xs text-gray-400 mt-1">Emory University School of Medicine</p>
                                 </div>
