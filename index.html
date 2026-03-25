@@ -1428,8 +1428,9 @@
                 };
 
                 loadData();
-            }, [currentUser, toast]);
-            
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, [currentUser]);
+
             const handleLoiSubmit = async () => {
                 try {
                     // Validate required fields
@@ -1922,14 +1923,15 @@
                 };
                 
                 loadData();
-            }, [toast]);
-            
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, []);
+
             if (loading) return <LoadingSpinner />;
-            
+
             return (
                 <div className="max-w-7xl mx-auto">
                     <PermissionBanner />
-                    
+
                     {/* Welcome Banner */}
                     <div className="emory-navy text-white rounded-lg shadow-lg p-8 m-4 mt-6">
                         <h1 className="text-3xl font-bold mb-2">Welcome, {currentUser}</h1>
@@ -2034,10 +2036,11 @@
                 };
 
                 loadData();
-            }, [toast]);
-            
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, []);
+
             if (loading) return <LoadingSpinner />;
-            
+
             return (
                 <div className="max-w-7xl mx-auto">
                     <PermissionBanner />
