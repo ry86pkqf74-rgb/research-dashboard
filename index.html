@@ -140,15 +140,19 @@
             const SHAREPOINT_SITE = 'https://emory.sharepoint.com/sites/GeneralSurgery';
 
             // MSAL Configuration
-            // NOTE: To enable full SSO, register an Azure AD app at https://portal.azure.com
-            // Required: Single-page application redirect URI = your GitHub Pages URL
-            // Required API permissions: Sites.Read.All, User.Read, Group.Read.All
+            // SSO can be activated by:
+            //   1. Setting window.MSAL_CLIENT_ID before this script loads
+            //   2. Adding ?clientId=YOUR-ID to the URL
+            //   3. Editing the clientId below after Azure AD app registration
+            const urlParams = new URLSearchParams(window.location.search);
+            const configuredClientId = window.MSAL_CLIENT_ID
+                || urlParams.get('clientId')
+                || '00000000-0000-0000-0000-000000000000';
+
             const msalConfig = {
                 auth: {
-                    // Default: Microsoft common endpoint (works for any Microsoft account)
-                    // Replace with your registered Azure AD App Client ID for full SSO
-                    clientId: window.MSAL_CLIENT_ID || '00000000-0000-0000-0000-000000000000',
-                    authority: window.MSAL_AUTHORITY || 'https://login.microsoftonline.com/emory.edu',
+                    clientId: configuredClientId,
+                    authority: window.MSAL_AUTHORITY || 'https://login.microsoftonline.com/e004fb9c-b0a4-424f-bcd0-322606d5df38',
                     redirectUri: window.location.origin + window.location.pathname,
                     postLogoutRedirectUri: window.location.origin + window.location.pathname,
                 },
