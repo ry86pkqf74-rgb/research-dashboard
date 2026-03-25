@@ -378,16 +378,32 @@
             };
 
             async function callFlow(payload) {
-                const resp = await fetch(FLOW_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                if (!resp.ok) {
-                    const errText = await resp.text();
-                    throw new Error('Flow error ' + resp.status + ': ' + errText);
+                // Use text/plain to avoid CORS preflight (OPTIONS request).
+                // Power Automate HTTP triggers don't respond to OPTIONS,
+                // causing cross-origin requests with application/json to hang.
+                // The flow still parses the JSON body correctly.
+                const controller = new AbortController();
+                const timeoutId = setTimeout(function() { controller.abort(); }, 15000);
+                try {
+                    const resp = await fetch(FLOW_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'text/plain' },
+                        body: JSON.stringify(payload),
+                        signal: controller.signal
+                    });
+                    clearTimeout(timeoutId);
+                    if (!resp.ok) {
+                        const errText = await resp.text();
+                        throw new Error('Flow error ' + resp.status + ': ' + errText);
+                    }
+                    return await resp.json();
+                } catch(e) {
+                    clearTimeout(timeoutId);
+                    if (e.name === 'AbortError') {
+                        throw new Error('Power Automate request timed out (15s)');
+                    }
+                    throw e;
                 }
-                return await resp.json();
             }
 
             // Get items from a SharePoint list
@@ -1421,7 +1437,23 @@
                         }
                     } catch (error) {
                         console.error('Error loading data:', error);
-                        toast.addToast('Error loading dashboard data: ' + error.message, 'error');
+                        // Fall back to demo data on any error
+                        setResidents([{
+                            ResidentKey: 'DEMO001', ResidentName: currentUser,
+                            EmoryEmail: `${currentUser.toLowerCase().replace(' ', '.')}@emory.edu`,
+                            PGYLevel: 'PGY-2', MentorKey: 'MENT001',
+                            StartDate: '2023-07-01', EndDate: '2026-06-30',
+                            ResearchTrack: 'Clinical Research', _demo: true,
+                        }]);
+                        setResearchCycles([{
+                            CycleKey: 'DEMO-CYC001', ResidentKey: 'DEMO001',
+                            ProjectTitle: 'Sample Project (Demo Mode)',
+                            LOIStatus: 'Approved', ResearchPlanType: 'Clinical',
+                            ProjectOverview: 'Connect to SharePoint for live data.',
+                            _demo: true,
+                        }]);
+                        setDocuments([]);
+                        toast.addToast('Using demo data (connection issue)', 'error');
                     } finally {
                         setLoading(false);
                     }
